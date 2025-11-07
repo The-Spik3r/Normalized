@@ -11,6 +11,7 @@ import os
 import re
 import time
 import logging
+import unicodedata
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -28,6 +29,106 @@ from datetime import datetime
 from csv_to_sql import CSVToSQLConverter
 
 console = Console()
+
+
+def sanitize_name(name: str) -> str:
+    """
+    Sanitiza nombres para manejo internacional (Brasil, India, Canadá, Reino Unido, Estados Unidos)
+
+    Funcionalidades:
+    - Convierte a minúsculas
+    - Normaliza caracteres Unicode (acentos, diéresis, etc.)
+    - Maneja caracteres especiales de múltiples idiomas
+    - Preserva guiones y espacios como separadores válidos
+    - Elimina caracteres problemáticos para SQL
+    """
+    if pd.isna(name) or name is None:
+        return None
+
+    # Convertir a string y strip
+    name = str(name).strip()
+    if not name:
+        return None
+
+    # Convertir a minúsculas
+    name = name.lower()
+
+    # Normalizar caracteres Unicode (NFD = Normalization Form Decomposed)
+    # Esto separa caracteres como á en a + ´
+    normalized = unicodedata.normalize("NFD", name)
+
+    # Eliminar marcas diacríticas (acentos, tildes, etc.) pero mantener caracteres base
+    ascii_name = "".join(
+        char
+        for char in normalized
+        if unicodedata.category(char) != "Mn"  # 'Mn' = Nonspacing_Mark (acentos)
+    )
+
+    # Reemplazar caracteres especiales comunes por sus equivalentes ASCII
+    replacements = {
+        # Caracteres latinos extendidos
+        "ß": "ss",  # Alemán
+        "æ": "ae",  # Danés, Noruego
+        "ø": "o",  # Danés, Noruego
+        "å": "a",  # Escandinavo
+        "ñ": "n",  # Español
+        "ç": "c",  # Francés, Portugués
+        "œ": "oe",  # Francés
+        # Caracteres de puntuación que pueden aparecer en nombres
+        "'": "",  # Apostrofe (O'Connor -> oconnor)
+        "'": "",  # Apostrofe curvo diferente
+        "`": "",  # Acento grave
+        "´": "",  # Acento agudo
+        "^": "",  # Circunflejo
+        "~": "",  # Tilde
+        '"': "",  # Comillas dobles
+        '"': "",  # Comillas curvas abrir
+        '"': "",  # Comillas curvas cerrar
+        # Caracteres especiales de nombres internacionales
+        "ł": "l",  # Polaco
+        "đ": "d",  # Vietnamita, Serbio
+        "ħ": "h",  # Maltés
+        "ŧ": "t",  # Sami
+        # Espacios y separadores -> guiones
+        " ": "-",  # Espacios a guiones
+        "_": "-",  # Underscores a guiones
+        ".": "-",  # Puntos a guiones
+        "/": "-",  # Barras a guiones
+        "\\": "-",  # Backslashes a guiones
+    }
+
+    # Aplicar reemplazos
+    for original, replacement in replacements.items():
+        ascii_name = ascii_name.replace(original, replacement)
+
+    # Eliminar caracteres que no sean letras, números o guiones
+    # Esto maneja caracteres de otros alfabetos (cirílico, árabe, hindi, etc.)
+    sanitized = re.sub(r"[^a-z0-9\-]", "", ascii_name)
+
+    # Limpiar múltiples guiones consecutivos
+    sanitized = re.sub(r"-+", "-", sanitized)
+
+    # Eliminar guiones al inicio y final
+    sanitized = sanitized.strip("-")
+
+    # Si después de todo el procesamiento el nombre está vacío, retornar None
+    if not sanitized:
+        return None
+
+    return sanitized
+
+
+def sanitize_international_names_batch(names_series: pd.Series) -> pd.Series:
+    """
+    Sanitiza una serie de nombres de forma eficiente
+
+    Args:
+        names_series: Serie de pandas con nombres a sanitizar
+
+    Returns:
+        Serie de pandas con nombres sanitizados
+    """
+    return names_series.apply(sanitize_name)
 
 
 class InteractiveCSVConverter:
@@ -742,7 +843,7 @@ class InteractiveCSVConverter:
 
 
 class CustomCSVToSQLConverter(CSVToSQLConverter):
-    """Versión personalizada del convertidor con mapeo de columnas"""
+    """Versión personalizada del convertidor con mapeo de columnas y manejo robusto de errores"""
 
     def __init__(
         self,
@@ -754,6 +855,8 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
         super().__init__(csv_file_path, table_name)
         self.column_mapping = column_mapping
         self.type_mapping = type_mapping
+        self.error_count = 0
+        self.skipped_lines = []
 
     def _detect_data_types(self, df: pd.DataFrame) -> Dict[str, str]:
         """Usa los tipos personalizados en lugar de detección automática"""
@@ -764,17 +867,107 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
             result[new_col_name] = sql_type
         return result
 
+    def _is_name_column(self, column_name: str) -> bool:
+        """
+        Detecta si una columna contiene nombres basándose en el nombre de la columna
+        """
+        name_indicators = [
+            "name",
+            "nombre",
+            "nom",
+            "nome",  # Inglés, Español, Francés, Portugués
+            "full_name",
+            "fullname",
+            "complete_name",
+            "first_name",
+            "firstname",
+            "fname",
+            "given_name",
+            "last_name",
+            "lastname",
+            "lname",
+            "surname",
+            "family_name",
+            "middle_name",
+            "middlename",
+            "mname",
+            "nick_name",
+            "nickname",
+            "nick",
+            "alias",
+            "display_name",
+            "screen_name",
+            "user_name",
+            "username",
+            "contact_name",
+            "person_name",
+            "client_name",
+            "customer_name",
+            "employee_name",
+            "staff_name",
+            "member_name",
+        ]
+
+        column_lower = column_name.lower().strip()
+        return any(indicator in column_lower for indicator in name_indicators)
+
+    def _escape_sql_value(self, value, column_name: str = "") -> str:
+        """
+        Escapa valores para SQL con sanitización especial para nombres
+
+        Args:
+            value: Valor a escapar
+            column_name: Nombre de la columna (para detectar si es un nombre)
+
+        Returns:
+            str: Valor escapado para SQL
+        """
+        if pd.isna(value) or value is None:
+            return "NULL"
+
+        # Convertir a string
+        str_value = str(value).strip()
+        if not str_value:
+            return "NULL"
+
+        # Si es una columna de nombres, aplicar sanitización
+        if self._is_name_column(column_name):
+            sanitized_name = sanitize_name(str_value)
+            if sanitized_name is None:
+                return "NULL"
+            # Escapar comillas simples después de sanitizar
+            escaped = sanitized_name.replace("'", "''")
+            return f"'{escaped}'"
+
+        # Para otros tipos de datos, usar escape normal
+        if isinstance(value, str):
+            # Escapar comillas simples
+            escaped = str_value.replace("'", "''")
+            return f"'{escaped}'"
+        elif isinstance(value, (int, float)):
+            return str(value)
+        elif isinstance(value, bool):
+            return "TRUE" if value else "FALSE"
+        else:
+            # Para otros tipos, escapar como string
+            escaped = str_value.replace("'", "''")
+            return f"'{escaped}'"
+
     def convert_to_sql(self, chunk_size: int = 1000, max_rows: int = None) -> str:
-        """Conversión personalizada con mapeo de columnas"""
+        """Conversión personalizada con mapeo de columnas y manejo robusto de errores"""
         logging.info(f"Iniciando conversión personalizada de {self.csv_file_path}")
 
         # Configurar archivo de salida
         base_name = os.path.splitext(os.path.basename(self.csv_file_path))[0]
         self.sql_file_path = f"{base_name}_custom_insert_statements.sql"
 
+        # Reiniciar contadores
+        self.error_count = 0
+        self.skipped_lines = []
+
         try:
-            # Leer muestra para crear estructura
-            sample_df = pd.read_csv(self.csv_file_path, nrows=1000)
+            # Leer muestra para crear estructura (con manejo de errores)
+            sample_df = pd.read_csv(self.csv_file_path, nrows=1000, on_bad_lines="skip")
 
             # Aplicar mapeo de columnas
             sample_df.columns = [
@@ -788,56 +981,148 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
 
             # Crear archivo SQL
             with open(self.sql_file_path, "w", encoding="utf-8") as sql_file:
-                # Header
+                # Header mejorado
                 sql_file.write(f"-- Archivo SQL generado desde: {self.csv_file_path}\n")
                 sql_file.write(
                     f"-- Generado el: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 )
-                sql_file.write("-- Conversión personalizada con mapeo de columnas\n\n")
+                sql_file.write("-- Conversión personalizada con mapeo de columnas\n")
+                sql_file.write("-- Modo robusto: Ignora líneas malformadas\n\n")
 
                 # CREATE TABLE personalizado
                 create_table_sql = self.create_table_sql(column_types)
                 sql_file.write(create_table_sql)
 
-                # Procesar datos
+                # Procesar datos con manejo robusto de errores
                 processed_rows = 0
+                total_chunks = 0
 
-                for chunk_df in pd.read_csv(self.csv_file_path, chunksize=chunk_size):
-                    if max_rows and processed_rows >= max_rows:
-                        break
+                # Usar iterador robusto que maneja errores
+                try:
+                    chunk_iterator = pd.read_csv(
+                        self.csv_file_path,
+                        chunksize=chunk_size,
+                        on_bad_lines="skip",  # Saltar líneas malformadas
+                        dtype=str,  # Leer todo como string para evitar errores de tipo
+                    )
 
-                    # Aplicar mapeo de columnas
-                    chunk_df.columns = [
-                        self.column_mapping.get(col, col) for col in chunk_df.columns
-                    ]
+                    for chunk_df in chunk_iterator:
+                        total_chunks += 1
 
-                    # Generar INSERT statements
-                    for _, row in chunk_df.iterrows():
                         if max_rows and processed_rows >= max_rows:
                             break
 
-                        values = []
-                        for col in chunk_df.columns:
-                            values.append(self._escape_sql_value(row[col]))
+                        # Validar que el chunk tenga el número correcto de columnas
+                        expected_cols = len(self.column_mapping)
+                        if len(chunk_df.columns) != expected_cols:
+                            logging.warning(
+                                f"Chunk {total_chunks}: Esperado {expected_cols} columnas, encontrado {len(chunk_df.columns)}"
+                            )
+                            # Ajustar columnas si es necesario
+                            if len(chunk_df.columns) < expected_cols:
+                                # Añadir columnas faltantes con None
+                                original_cols = list(self.column_mapping.keys())
+                                for i in range(len(chunk_df.columns), expected_cols):
+                                    chunk_df[f"missing_col_{i}"] = None
+                            else:
+                                # Truncar columnas extra
+                                chunk_df = chunk_df.iloc[:, :expected_cols]
 
-                        values_str = ", ".join(values)
-                        columns_str = ", ".join(chunk_df.columns)
+                        # Aplicar mapeo de columnas de forma segura
+                        try:
+                            original_cols = list(self.column_mapping.keys())
+                            chunk_df.columns = [
+                                self.column_mapping.get(original_cols[i], f"col_{i}")
+                                for i in range(len(chunk_df.columns))
+                            ]
+                        except Exception as e:
+                            logging.warning(
+                                f"Error en mapeo de columnas en chunk {total_chunks}: {e}"
+                            )
+                            # Usar mapeo básico como fallback
+                            chunk_df.columns = [
+                                f"col_{i}" for i in range(len(chunk_df.columns))
+                            ]
 
-                        insert_sql = f"INSERT INTO {self.table_name} ({columns_str}) VALUES ({values_str});\n"
-                        sql_file.write(insert_sql)
+                        # Procesar filas con manejo individual de errores
+                        for idx, row in chunk_df.iterrows():
+                            if max_rows and processed_rows >= max_rows:
+                                break
 
-                        processed_rows += 1
+                            try:
+                                values = []
+                                for col in chunk_df.columns:
+                                    values.append(self._escape_sql_value(row[col], col))
 
-                # Footer
-                sql_file.write(
-                    f"\n-- Total de registros insertados: {processed_rows}\n"
+                                values_str = ", ".join(values)
+                                columns_str = ", ".join(chunk_df.columns)
+
+                                insert_sql = f"INSERT INTO {self.table_name} ({columns_str}) VALUES ({values_str});\n"
+                                sql_file.write(insert_sql)
+                                processed_rows += 1
+
+                            except Exception as e:
+                                self.error_count += 1
+                                error_info = (
+                                    f"Chunk {total_chunks}, Fila {idx}: {str(e)[:100]}"
+                                )
+                                self.skipped_lines.append(error_info)
+                                logging.warning(
+                                    f"Error procesando fila {processed_rows + self.error_count}: {e}"
+                                )
+                                continue
+
+                        # Log progreso cada 10 chunks
+                        if total_chunks % 10 == 0:
+                            logging.info(
+                                f"Procesados {total_chunks} chunks, {processed_rows} filas válidas, {self.error_count} errores"
+                            )
+
+                except Exception as e:
+                    logging.error(f"Error crítico en el procesamiento: {e}")
+                    # Si hay un error crítico, al menos procesamos lo que tenemos
+
+                # Footer con estadísticas
+                success_rate = (
+                    (processed_rows / (processed_rows + self.error_count)) * 100
+                    if (processed_rows + self.error_count) > 0
+                    else 100
                 )
-                sql_file.write("COMMIT;\n")
 
+                sql_file.write("\n-- ESTADÍSTICAS DE CONVERSIÓN\n")
+                sql_file.write(
+                    f"-- Total de registros procesados exitosamente: {processed_rows}\n"
+                )
+                sql_file.write(
+                    f"-- Total de errores/líneas omitidas: {self.error_count}\n"
+                )
+                sql_file.write(f"-- Tasa de éxito: {success_rate:.2f}%\n")
+                sql_file.write(f"-- Chunks procesados: {total_chunks}\n")
+
+                if self.error_count > 0 and len(self.skipped_lines) > 0:
+                    sql_file.write("\n-- PRIMEROS 5 ERRORES ENCONTRADOS:\n")
+                    for i, error in enumerate(self.skipped_lines[:5]):
+                        sql_file.write(f"-- Error {i + 1}: {error}\n")
+
+                sql_file.write("\nCOMMIT;\n")
+
+            # Log final con estadísticas
             logging.info(
                 f"Conversión completada. Archivo SQL creado: {self.sql_file_path}"
             )
-            logging.info(f"Total de filas procesadas: {processed_rows}")
+            logging.info(f"Filas procesadas exitosamente: {processed_rows}")
+            logging.info(f"Errores encontrados: {self.error_count}")
+            logging.info(f"Tasa de éxito: {success_rate:.2f}%")
+
+            # Mostrar estadísticas en consola si hay errores
+            if self.error_count > 0:
+                console.print(
+                    f"\n⚠️ [yellow]Se encontraron {self.error_count} líneas con errores (omitidas)[/yellow]"
+                )
+                console.print(f"✅ [green]Tasa de éxito: {success_rate:.2f}%[/green]")
+                console.print(
+                    f"📊 [cyan]Filas válidas procesadas: {processed_rows:,}[/cyan]"
+                )
 
             return self.sql_file_path
 
