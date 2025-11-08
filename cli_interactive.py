@@ -30,6 +30,22 @@ from csv_to_sql import CSVToSQLConverter
 
 console = Console()
 
+# Importar funciones de reparación SQL
+try:
+    from sql_repair_fixed import (
+        parse_create_table,
+        interactive_edit,
+        build_create_table_sql,
+        extract_insert_statements,
+        try_generate_inserts_from_csv,
+        create_sqlite_from_sql,
+        ask_sqlite_processing_option,
+    )
+
+    SQL_REPAIR_AVAILABLE = True
+except ImportError:
+    SQL_REPAIR_AVAILABLE = False
+
 
 def sanitize_name(name: str) -> str:
     """
@@ -76,14 +92,11 @@ def sanitize_name(name: str) -> str:
         "œ": "oe",  # Francés
         # Caracteres de puntuación que pueden aparecer en nombres
         "'": "",  # Apostrofe (O'Connor -> oconnor)
-        "'": "",  # Apostrofe curvo diferente
         "`": "",  # Acento grave
         "´": "",  # Acento agudo
         "^": "",  # Circunflejo
         "~": "",  # Tilde
         '"': "",  # Comillas dobles
-        '"': "",  # Comillas curvas abrir
-        '"': "",  # Comillas curvas cerrar
         # Caracteres especiales de nombres internacionales
         "ł": "l",  # Polaco
         "đ": "d",  # Vietnamita, Serbio
@@ -131,6 +144,167 @@ def sanitize_international_names_batch(names_series: pd.Series) -> pd.Series:
     return names_series.apply(sanitize_name)
 
 
+def sql_repair_mode():
+    """Modo de reparación de SQL"""
+    if not SQL_REPAIR_AVAILABLE:
+        console.print("[red]❌ Módulo de reparación SQL no disponible[/red]")
+        return False
+
+    console.clear()
+    console.print(
+        Panel(
+            "[bold]🛠️ REPARACIÓN DE ARCHIVOS SQL[/bold]\n\n"
+            "Esta herramienta te permite:\n"
+            "• 📋 Parsear un CREATE TABLE existente\n"
+            "• ❌ Eliminar columnas no deseadas\n"
+            "• ✏️ Renombrar columnas y cambiar tipos\n"
+            "• 🏷️ Cambiar nombre de la tabla\n"
+            "• 📄 Generar SQL corregido\n"
+            "• 📊 (Opcional) Añadir INSERTs desde CSV\n",
+            title="🔧 SQL Repair Tool",
+            border_style="blue",
+        )
+    )
+
+    # Seleccionar archivo SQL
+    sql_path = Prompt.ask("📁 Ruta del archivo SQL a reparar")
+
+    if not os.path.exists(sql_path):
+        console.print(f"[red]❌ No existe el archivo: {sql_path}[/red]")
+        return False
+
+    try:
+        # Leer archivo SQL
+        with open(sql_path, "r", encoding="utf-8", errors="ignore") as f:
+            sql_text = f.read()
+
+        # Parsear CREATE TABLE
+        table_name, columns = parse_create_table(sql_text)
+
+        # Edición interactiva
+        new_table_name, edited_columns, _ = interactive_edit(table_name, columns)
+
+        # Generar SQL corregido
+        corrected_sql = build_create_table_sql(new_table_name, edited_columns)
+
+        # Escribir archivo corregido
+        base = os.path.splitext(os.path.basename(sql_path))[0]
+        out_file = os.path.join(os.path.dirname(sql_path), f"{base}_corrected.sql")
+
+        with open(out_file, "w", encoding="utf-8") as f:
+            f.write("-- Archivo SQL corregido/generado por CSV to SQL Converter CLI\n")
+            f.write(f"-- Fuente: {sql_path}\n")
+            f.write(
+                f"-- Generado el: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            )
+            f.write(corrected_sql)
+
+            # Siempre buscar y generar INSERTs desde VALUES existentes o INSERT statements
+            console.print(
+                "[cyan]🔍 Buscando INSERT statements y VALUES en el archivo original...[/cyan]"
+            )
+            column_names = [col[0] for col in edited_columns]
+            insert_sql = extract_insert_statements(
+                sql_text, new_table_name, column_names
+            )
+
+            if insert_sql.strip():  # Solo escribir si encontramos INSERT statements
+                f.write(
+                    "\n-- INSERT statements (existentes y extraídos desde VALUES)\n"
+                )
+                f.write(insert_sql)
+                console.print(
+                    "[green]✅ INSERT statements incluidos en el archivo[/green]"
+                )
+            else:
+                console.print(
+                    "[yellow]⚠️ No se encontraron INSERT statements ni VALUES en el archivo[/yellow]"
+                )
+
+        # Mostrar estadísticas del archivo generado
+        file_size = os.path.getsize(out_file) / (1024 * 1024)  # MB
+        console.print(
+            Panel(
+                f"✅ SQL corregido escrito en: [bold]{out_file}[/bold]\n"
+                f"📊 Tamaño del archivo: [cyan]{file_size:.2f} MB[/cyan]",
+                title="🎉 Completado",
+                border_style="green",
+            )
+        )
+
+        # Preguntar por INSERTs desde CSV solo si no se encontraron VALUES
+        if not insert_sql.strip() and Confirm.ask(
+            "📄 No se encontraron VALUES. ¿Deseas generar INSERTs desde un CSV?",
+            default=False,
+        ):
+            csv_path = Prompt.ask("� Ruta del archivo CSV")
+            if os.path.exists(csv_path):
+                column_names = [col[0] for col in edited_columns]
+                success = try_generate_inserts_from_csv(
+                    csv_path, column_names, out_file, new_table_name
+                )
+                if success:
+                    console.print(
+                        "[green]✅ INSERTs desde CSV generados exitosamente[/green]"
+                    )
+                else:
+                    console.print(
+                        "[yellow]⚠️ Hubo problemas generando los INSERTs desde CSV[/yellow]"
+                    )
+            else:
+                console.print(f"[red]❌ No se encontró el CSV: {csv_path}[/red]")
+
+        # Preguntar si quiere crear base de datos SQLite
+        console.print("\n" + "=" * 80)
+        console.print(
+            Panel(
+                "¿Deseas crear una base de datos SQLite y ejecutar las migraciones?\n\n"
+                "🗄️ Esto creará un archivo .db listo para usar con todos los datos importados.\n"
+                "📊 Ideal para consultas, análisis o integración con aplicaciones.",
+                title="🗄️ Crear Base de Datos SQLite",
+                border_style="cyan",
+            )
+        )
+
+        if Confirm.ask("¿Crear base de datos SQLite con los datos?", default=True):
+            # Preguntar cuántos registros procesar para SQLite
+            console.print(
+                Panel(
+                    "Selecciona cuántos registros migrar a la base de datos SQLite.\n"
+                    "💡 Para archivos grandes, se recomienda empezar con una muestra.",
+                    title="📊 Configurar Migración SQLite",
+                    border_style="blue",
+                )
+            )
+
+            max_inserts = ask_sqlite_processing_option()
+
+            sqlite_file = create_sqlite_from_sql(out_file, new_table_name, max_inserts)
+            if sqlite_file:
+                console.print("\n")
+                console.print(
+                    Panel(
+                        f"🎉 ¡Base de datos SQLite creada exitosamente!\n\n"
+                        f"📍 Ubicación: [bold]{sqlite_file}[/bold]\n"
+                        f"💡 Puedes usarla con: [dim]sqlite3 {os.path.basename(sqlite_file)}[/dim]",
+                        title="✅ Base de Datos Lista",
+                        border_style="green",
+                    )
+                )
+            else:
+                console.print("[red]❌ No se pudo crear la base de datos SQLite[/red]")
+
+        console.print("\n🎉 ¡Reparación completada exitosamente!")
+        return True
+
+    except ValueError as e:
+        console.print(f"[red]❌ {e}[/red]")
+        return False
+    except Exception as e:
+        console.print(f"[red]❌ Error inesperado: {e}[/red]")
+        return False
+
+
 class InteractiveCSVConverter:
     def __init__(self):
         self.csv_file = None
@@ -140,39 +314,23 @@ class InteractiveCSVConverter:
         self.sample_df = None
 
     def show_welcome(self):
-        """Muestra la pantalla de bienvenida con animación"""
-        console.clear()
+        """Muestra la pantalla de bienvenida para conversión CSV"""
+        console.print(
+            Panel(
+                "[bold]� CONVERSIÓN CSV A SQL[/bold]\n\n"
+                "Este flujo te permitirá:\n"
+                "• 📁 Seleccionar archivo CSV\n"
+                "• 🔍 Analizar estructura automáticamente\n"
+                "• 🏷️ Configurar nombre de tabla\n"
+                "• ⚙️ Personalizar columnas y tipos\n"
+                "• 🧹 Sanitización automática de nombres\n"
+                "• 💾 Generar SQL con INSERT statements\n",
+                title="� CSV Converter",
+                border_style="cyan",
+            )
+        )
 
-        # Título animado
-        title = """
-╔═══════════════════════════════════════════════════════════════╗
-║                                                               ║
-║    🚀 CSV TO SQL CONVERTER - INTERACTIVE CLI 🚀               ║
-║                                                               ║
-║    ✨ Convierte archivos CSV a SQL con personalización        ║
-║    🎨 Interfaz interactiva con animaciones                    ║
-║    ⚙️  Control total sobre nombres y tipos de datos           ║
-║                                                               ║
-╚═══════════════════════════════════════════════════════════════╝
-        """
-
-        console.print(title, style="bold cyan")
-        time.sleep(1)
-
-        # Información del sistema
-        info_table = Table(show_header=False, box=None)
-        info_table.add_column("", style="dim")
-        info_table.add_column("", style="bold")
-
-        info_table.add_row("📅 Fecha:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        info_table.add_row("💻 Sistema:", "CSV to SQL Interactive Converter v2.0")
-        info_table.add_row("🎯 Objetivo:", "Conversión personalizada de CSV a SQL")
-
-        console.print(info_table)
-        console.print()
-
-        if not Confirm.ask("¿Comenzamos la conversión interactiva?", default=True):
-            console.print("👋 ¡Hasta luego!", style="yellow")
+        if not Confirm.ask("¿Comenzamos la conversión de CSV a SQL?", default=True):
             return False
 
         return True
@@ -294,6 +452,19 @@ class InteractiveCSVConverter:
 
         return True
 
+    def count_total_rows(self) -> int:
+        """Cuenta el total de filas en el archivo CSV (excluyendo el header)"""
+        try:
+            with console.status("[bold green]Contando filas totales..."):
+                # Contar líneas del archivo (más eficiente que cargar todo el DataFrame)
+                with open(self.csv_file, "r", encoding="utf-8") as f:
+                    total_lines = sum(1 for line in f)
+                # Restar 1 para excluir el header
+                return total_lines - 1
+        except Exception as e:
+            console.print(f"[red]❌ Error al contar filas: {e}[/red]")
+            return 0
+
     def configure_table_name(self) -> bool:
         """Configura el nombre de la tabla"""
         console.print("\n🏷️  [bold]CONFIGURACIÓN DE TABLA[/bold]", style="blue")
@@ -346,10 +517,138 @@ class InteractiveCSVConverter:
         )
         return True
 
+    def _configure_columns_to_exclude(self) -> bool:
+        """Permite al usuario seleccionar qué columnas eliminar de la tabla"""
+        console.print(
+            "\n🗑️  [bold]SELECCIÓN DE COLUMNAS A EXCLUIR[/bold]", style="yellow"
+        )
+        console.print("─" * 50)
+        console.print(
+            "💡 [dim]Selecciona las columnas que NO quieres incluir en la tabla SQL[/dim]"
+        )
+        console.print(
+            "💡 [dim]Útil para: IDs autoincrement, timestamps automáticos, columnas calculadas, etc.[/dim]\n"
+        )
+
+        # Mostrar preview de las columnas disponibles
+        preview_table = Table(title="📋 Columnas Disponibles en el CSV")
+        preview_table.add_column("N°", style="cyan", no_wrap=True, width=4)
+        preview_table.add_column("Nombre de Columna", style="green", no_wrap=True)
+        preview_table.add_column("Tipo Detectado", style="magenta", no_wrap=True)
+        preview_table.add_column("Muestra de Datos", style="yellow", max_width=30)
+
+        for i, column in enumerate(self.sample_df.columns, 1):
+            detected_type = self._detect_column_type(column)
+            # Obtener muestra de datos (primeros 3 valores no-nulos)
+            sample_data = self.sample_df[column].dropna().head(3).tolist()
+            sample_str = (
+                ", ".join([str(x)[:20] for x in sample_data]) if sample_data else "N/A"
+            )
+
+            preview_table.add_row(
+                str(i),
+                str(column),
+                detected_type,
+                sample_str + ("..." if len(sample_str) > 30 else ""),
+            )
+
+        console.print(preview_table)
+
+        # Preguntar si quiere excluir columnas
+        questions = [
+            inquirer.Confirm(
+                "exclude_columns",
+                message="¿Deseas excluir alguna columna de la tabla SQL?",
+                default=False,
+            )
+        ]
+
+        answers = inquirer.prompt(questions)
+        if not answers["exclude_columns"]:
+            console.print(
+                "✅ [green]Todas las columnas serán incluidas en la tabla[/green]"
+            )
+            return True
+
+        # Crear lista de columnas para selección múltiple
+        column_choices = []
+        for i, column in enumerate(self.sample_df.columns):
+            # Detectar casos comunes de columnas que se suelen excluir
+            exclude_hints = []
+            col_lower = str(column).lower()
+
+            if any(x in col_lower for x in ["id", "key", "pk", "primary"]):
+                exclude_hints.append("🔑 ID/Key")
+            if any(
+                x in col_lower
+                for x in ["created", "updated", "modified", "timestamp", "date_created"]
+            ):
+                exclude_hints.append("📅 Timestamp")
+            if any(x in col_lower for x in ["auto", "increment", "serial"]):
+                exclude_hints.append("🔢 Auto")
+            if any(x in col_lower for x in ["calculated", "computed", "derived"]):
+                exclude_hints.append("🧮 Calculado")
+
+            hint_text = f" ({', '.join(exclude_hints)})" if exclude_hints else ""
+            column_choices.append(f"{column}{hint_text}")
+
+        # Selección múltiple de columnas a excluir
+        questions = [
+            inquirer.Checkbox(
+                "columns_to_exclude",
+                message="Selecciona las columnas que quieres EXCLUIR (usa ESPACIO para marcar, ENTER para confirmar):",
+                choices=column_choices,
+                default=[],
+            )
+        ]
+
+        answers = inquirer.prompt(questions)
+        if not answers:
+            return False
+
+        excluded_columns = []
+        for selected in answers["columns_to_exclude"]:
+            # Extraer el nombre original de la columna (antes de los hints)
+            original_name = selected.split(" (")[0] if " (" in selected else selected
+            excluded_columns.append(original_name)
+
+        if excluded_columns:
+            # Actualizar el DataFrame para excluir las columnas seleccionadas
+            self.sample_df = self.sample_df.drop(columns=excluded_columns)
+
+            console.print(
+                f"\n🗑️ [red]Columnas excluidas:[/red] {', '.join(excluded_columns)}"
+            )
+            console.print(
+                f"✅ [green]Columnas restantes:[/green] {len(self.sample_df.columns)} de {len(self.sample_df.columns) + len(excluded_columns)} originales"
+            )
+
+            # Mostrar tabla final
+            final_table = Table(title="📋 Columnas Finales para la Tabla SQL")
+            final_table.add_column("N°", style="cyan", no_wrap=True)
+            final_table.add_column("Columna", style="green", no_wrap=True)
+            final_table.add_column("Tipo", style="magenta", no_wrap=True)
+
+            for i, column in enumerate(self.sample_df.columns, 1):
+                final_table.add_row(
+                    str(i), str(column), self._detect_column_type(column)
+                )
+
+            console.print("\n" + "─" * 50)
+            console.print(final_table)
+        else:
+            console.print("✅ [green]No se excluyeron columnas[/green]")
+
+        return True
+
     def configure_columns(self) -> bool:
         """Configura nombres y tipos de columnas"""
         console.print("\n🏗️  [bold]CONFIGURACIÓN DE COLUMNAS[/bold]", style="blue")
         console.print("─" * 50)
+
+        # Primero preguntar si quiere eliminar columnas
+        if not self._configure_columns_to_exclude():
+            return False
 
         # Preguntar nivel de personalización
         questions = [
@@ -711,6 +1010,9 @@ class InteractiveCSVConverter:
         console.print("\n🚀 [bold]INICIANDO CONVERSIÓN[/bold]", style="blue")
         console.print("=" * 50)
 
+        # Obtener el total de filas para mostrar en la opción "Archivo completo"
+        total_rows = self.count_total_rows()
+
         # Preguntar cantidad de filas
         questions = [
             inquirer.List(
@@ -720,7 +1022,7 @@ class InteractiveCSVConverter:
                     "🧪 Muestra pequeña (100 filas)",
                     "📊 Muestra mediana (5,000 filas)",
                     "📈 Muestra grande (50,000 filas)",
-                    "🌍 Archivo completo",
+                    f"🌍 Archivo completo ({total_rows:,} filas)",
                     "🛠️  Cantidad personalizada",
                 ],
             )
@@ -1131,6 +1433,71 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
             raise
 
 
+def show_main_menu():
+    """Muestra el menú principal y devuelve la opción seleccionada"""
+    console.clear()
+
+    # Título principal
+    title = """
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║    🚀 CSV TO SQL CONVERTER - INTERACTIVE CLI 🚀               ║
+║                                                               ║
+║    ✨ Suite completa de herramientas SQL                      ║
+║    🎨 Interfaz interactiva con animaciones                    ║
+║    ⚙️ Control total sobre conversión y reparación             ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+    """
+
+    console.print(title, style="bold cyan")
+
+    # Información del sistema
+    info_table = Table(show_header=False, box=None)
+    info_table.add_column("", style="dim")
+    info_table.add_column("", style="bold")
+
+    info_table.add_row("📅 Fecha:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    info_table.add_row("💻 Sistema:", "CSV to SQL Interactive Converter v2.1")
+    info_table.add_row("🎯 Funciones:", "Conversión CSV → SQL + Reparación SQL")
+
+    console.print(info_table)
+    console.print()
+
+    # Menú de opciones
+    console.print("🎯 [bold]SELECCIONA UNA OPCIÓN:[/bold]\n")
+
+    console.print("1️⃣  [cyan]Convertir CSV a SQL[/cyan] - Flujo principal de conversión")
+    console.print(
+        "2️⃣  [magenta]Reparar archivo SQL existente[/magenta] - Editar esquemas SQL"
+    )
+    if not SQL_REPAIR_AVAILABLE:
+        console.print(
+            "    [dim](Reparación SQL no disponible - falta sql_repair.py)[/dim]"
+        )
+    console.print("3️⃣  [yellow]Salir[/yellow]")
+    console.print()
+
+    while True:
+        choice = Prompt.ask("Elige una opción", choices=["1", "2", "3"], default="1")
+
+        if choice == "1":
+            return "csv_conversion"
+        elif choice == "2":
+            if SQL_REPAIR_AVAILABLE:
+                return "sql_repair"
+            else:
+                console.print(
+                    "[red]❌ La funcionalidad de reparación SQL no está disponible[/red]"
+                )
+                continue
+        elif choice == "3":
+            return None
+        else:
+            console.print("[red]❌ Opción no válida[/red]")
+            continue
+
+
 @click.command()
 @click.option(
     "--auto", is_flag=True, help="Ejecutar en modo automático sin interacciones"
@@ -1143,37 +1510,56 @@ def main(auto):
             "🤖 [yellow]Modo automático no implementado aún. Usando modo interactivo.[/yellow]"
         )
 
-    converter = InteractiveCSVConverter()
-
     try:
-        # Flujo principal
-        if not converter.show_welcome():
-            return
+        # Mostrar menú principal
+        mode = show_main_menu()
 
-        if not converter.select_csv_file():
+        if mode is None:
+            console.print("👋 ¡Hasta luego!", style="yellow")
             return
+        elif mode == "csv_conversion":
+            # Flujo de conversión CSV
+            converter = InteractiveCSVConverter()
 
-        if not converter.analyze_csv_structure():
-            return
+            if not converter.show_welcome():
+                return
 
-        if not converter.configure_table_name():
-            return
+            if not converter.select_csv_file():
+                return
 
-        if not converter.configure_columns():
-            return
+            if not converter.analyze_csv_structure():
+                return
 
-        if not converter.show_configuration_summary():
-            return
+            if not converter.configure_table_name():
+                return
 
-        if not converter.perform_conversion():
-            return
+            if not converter.configure_columns():
+                return
 
-        console.print(
-            "\n🎉 [bold green]¡Conversión completada exitosamente![/bold green]"
-        )
-        console.print(
-            "📚 [cyan]Consulta DATABASE_IMPORT_GUIDE.md para instrucciones de importación[/cyan]"
-        )
+            if not converter.show_configuration_summary():
+                return
+
+            if not converter.perform_conversion():
+                return
+
+            console.print(
+                "\n🎉 [bold green]¡Conversión completada exitosamente![/bold green]"
+            )
+            console.print(
+                "📚 [cyan]Consulta DATABASE_IMPORT_GUIDE.md para instrucciones de importación[/cyan]"
+            )
+
+        elif mode == "sql_repair":
+            # Flujo de reparación SQL
+            if not sql_repair_mode():
+                console.print(
+                    "[yellow]⚠️ No se pudo completar la reparación SQL[/yellow]"
+                )
+                return
+
+            console.print(
+                "\n🎉 [bold green]¡Reparación completada exitosamente![/bold green]"
+            )
 
     except KeyboardInterrupt:
         console.print("\n\n👋 [yellow]Proceso interrumpido por el usuario[/yellow]")
