@@ -3,3 +3,4 @@ numpy>=1.21.0
 click>=8.0.0
 rich>=13.0.0
 inquirer>=3.0.0
+psycopg2-binary>=2.9.0

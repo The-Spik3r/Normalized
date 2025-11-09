@@ -204,8 +204,9 @@ def sql_repair_mode():
                 "[cyan]🔍 Buscando INSERT statements y VALUES en el archivo original...[/cyan]"
             )
             column_names = [col[0] for col in edited_columns]
+            column_types = [col[1] for col in edited_columns]
             insert_sql = extract_insert_statements(
-                sql_text, new_table_name, column_names
+                sql_text, new_table_name, column_names, 0, None, column_types
             )
 
             if insert_sql.strip():  # Solo escribir si encontramos INSERT statements

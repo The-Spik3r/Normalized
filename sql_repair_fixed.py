@@ -8,15 +8,24 @@ import os
 import re
 import sys
 import sqlite3
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Optional
 from datetime import datetime
 
 import pandas as pd
 import inquirer
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Confirm, Prompt, IntPrompt
 from rich.table import Table
+
+# Importación opcional de PostgreSQL
+try:
+    import psycopg2
+    import psycopg2.extras
+
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
 from rich.progress import (
     Progress,
     SpinnerColumn,
@@ -274,7 +283,95 @@ def ask_processing_option(total_values: int) -> int:
                 console.print("[red]⚠️ Debe ser un número válido[/red]")
 
 
-def extract_filtered_values(value_block: str, kept_indices: List[int]) -> str:
+def sanitize_sql_value(value: str) -> str:
+    """
+    Sanitiza un valor individual para uso seguro en SQL (versión genérica).
+    """
+    return sanitize_sql_value_with_type(value, None)
+
+
+def sanitize_sql_value_with_type(value: str, column_type: str = None) -> str:
+    """
+    Sanitiza un valor individual para uso seguro en SQL respetando el tipo de columna.
+    """
+    if not value or value.strip() == "":
+        return "NULL"
+
+    value = value.strip()
+
+    # Si es NULL literal, devolverlo tal como está
+    if value.upper() == "NULL":
+        return "NULL"
+
+    # Si ya tiene comillas, removerlas para limpiar
+    if (value.startswith("'") and value.endswith("'")) or (
+        value.startswith('"') and value.endswith('"')
+    ):
+        value = value[1:-1]
+
+    # Si el tipo de columna es numérico (INT, INTEGER, DECIMAL, FLOAT, REAL, NUMERIC)
+    # y el valor es un número, devolverlo sin comillas
+    if column_type and any(
+        num_type in column_type.upper()
+        for num_type in ["INT", "DECIMAL", "FLOAT", "REAL", "NUMERIC"]
+    ):
+        import re
+
+        # Patrón para números: enteros, decimales (con o sin signo)
+        number_pattern = r"^[-+]?(?:\d+\.?\d*|\.\d+)$"
+        if re.match(number_pattern, value):
+            return value
+
+    # Para VARCHAR, CHAR, TEXT o cualquier otro tipo, siempre usar comillas
+    # Solo para números sin tipo especificado, verificar si es número
+    if column_type is None:
+        import re
+
+        # Patrón para números: enteros, decimales (con o sin signo)
+        number_pattern = r"^[-+]?(?:\d+\.?\d*|\.\d+)$"
+        if re.match(number_pattern, value):
+            return value
+
+    # ENFOQUE ROBUSTO: Decidir entre comillas simples o dobles según el contenido
+    import re
+
+    # 1. Limpiar caracteres de control peligrosos primero
+    # Remover caracteres de control ASCII (0x00-0x1f) y DEL (0x7f)
+    value = re.sub(r"[\x00-\x08\x0e-\x1f\x7f]", "", value)
+
+    # 2. Remover caracteres Unicode de control extendidos
+    value = re.sub(r"[\x80-\x9f]", "", value)
+
+    # 3. Normalizar espacios en blanco
+    value = value.replace("\n", " ")  # Saltos de línea a espacios
+    value = value.replace("\r", " ")  # Retornos de carro a espacios
+    value = value.replace("\t", " ")  # Tabs a espacios
+    value = re.sub(r"\s+", " ", value)  # Múltiples espacios a uno solo
+    value = value.strip()  # Limpiar espacios al inicio y final
+
+    # 4. Truncar si es demasiado largo
+    if len(value) > 65535:  # 64KB limit
+        value = value[:65535]
+
+    # 5. SANITIZAR APOSTROFES Y COMILLAS - SIEMPRE USAR COMILLAS SIMPLES
+    # Enfoque: remover apostrofes problemáticos en lugar de usar comillas dobles
+
+    # Opción 1: Escapar apostrofes duplicándolos (SQL estándar)
+    # value = value.replace("'", "''")
+
+    # Opción 2: Remover apostrofes completamente (más seguro y limpio)
+    value = value.replace("'", "")  # Remover apostrofes: "UK's" -> "UKs"
+
+    # También remover comillas dobles para evitar problemas
+    value = value.replace('"', "")  # Remover comillas dobles
+
+    # SIEMPRE usar comillas simples para strings en SQL
+    return f"'{value}'"
+
+
+def extract_filtered_values(
+    value_block: str, kept_indices: List[int], column_types: List[str] = None
+) -> str:
     """
     Extrae solo los valores de las columnas especificadas de un bloque VALUES.
     value_block: string como "(1001, 'teledyne.com', 'teledyne-technologies-incorporated', ...)"
@@ -290,6 +387,7 @@ def extract_filtered_values(value_block: str, kept_indices: List[int]) -> str:
     current_value = ""
     in_quotes = False
     quote_char = None
+    brace_depth = 0
     paren_depth = 0
 
     i = 0
@@ -304,10 +402,14 @@ def extract_filtered_values(value_block: str, kept_indices: List[int]) -> str:
                 in_quotes = False
                 quote_char = None
         elif char == "{":
-            paren_depth += 1
+            brace_depth += 1
         elif char == "}":
+            brace_depth -= 1
+        elif char == "(":
+            paren_depth += 1
+        elif char == ")":
             paren_depth -= 1
-        elif char == "," and not in_quotes and paren_depth == 0:
+        elif char == "," and not in_quotes and brace_depth == 0 and paren_depth == 0:
             values.append(current_value.strip())
             current_value = ""
             i += 1
@@ -320,11 +422,16 @@ def extract_filtered_values(value_block: str, kept_indices: List[int]) -> str:
     if current_value.strip():
         values.append(current_value.strip())
 
-    # Extraer solo los valores de los índices especificados
+    # Extraer solo los valores de los índices especificados y sanitizarlos
     filtered_values = []
-    for idx in kept_indices:
+    for i, idx in enumerate(kept_indices):
         if idx < len(values):
-            filtered_values.append(values[idx])
+            # Usar el tipo de columna si está disponible
+            col_type = (
+                column_types[i] if column_types and i < len(column_types) else None
+            )
+            sanitized_value = sanitize_sql_value_with_type(values[idx], col_type)
+            filtered_values.append(sanitized_value)
         else:
             filtered_values.append("NULL")  # Valor por defecto si no existe
 
@@ -337,6 +444,7 @@ def extract_insert_statements(
     column_names: List[str],
     max_values: int = 0,
     kept_indices: List[int] = None,
+    column_types: List[str] = None,
 ) -> str:
     """
     Extrae tanto INSERT statements existentes como VALUES sueltos del archivo SQL.
@@ -406,7 +514,9 @@ def extract_insert_statements(
         # extraer solo los valores de esas columnas
         if kept_indices:
             # Extraer valores del VALUES block usando los índices
-            filtered_values = extract_filtered_values(value_block, kept_indices)
+            filtered_values = extract_filtered_values(
+                value_block, kept_indices, column_types
+            )
             insert_sql = (
                 f"INSERT INTO {table_name} ({columns_str}) VALUES {filtered_values};"
             )
@@ -544,6 +654,150 @@ def ask_sqlite_processing_option() -> int:
                     console.print("[red]⚠️ Debe ser un número mayor a 0[/red]")
             except ValueError:
                 console.print("[red]⚠️ Debe ser un número válido[/red]")
+
+
+def get_postgres_credentials() -> Dict[str, str]:
+    """
+    Recopila las credenciales de PostgreSQL del usuario.
+    """
+    console.print(
+        Panel(
+            "🐘 Configuración de PostgreSQL\n"
+            "Proporciona los datos de conexión a tu base de datos PostgreSQL.",
+            title="Credenciales de PostgreSQL",
+            border_style="blue",
+        )
+    )
+
+    credentials = {}
+
+    # Host
+    credentials["host"] = Prompt.ask("[cyan]Host/Servidor[/cyan]", default="localhost")
+
+    # Puerto
+    credentials["port"] = str(IntPrompt.ask("[cyan]Puerto[/cyan]", default=5432))
+
+    # Base de datos
+    credentials["database"] = Prompt.ask("[cyan]Nombre de la base de datos[/cyan]")
+
+    # Usuario
+    credentials["user"] = Prompt.ask("[cyan]Usuario[/cyan]")
+
+    # Contraseña (sin mostrar)
+    credentials["password"] = Prompt.ask("[cyan]Contraseña[/cyan]", password=True)
+
+    return credentials
+
+
+def test_postgres_connection(credentials: Dict[str, str]) -> bool:
+    """
+    Prueba la conexión a PostgreSQL con las credenciales proporcionadas.
+    """
+    try:
+        conn = psycopg2.connect(**credentials)
+        conn.close()
+        console.print("[green]✓ Conexión exitosa a PostgreSQL[/green]")
+        return True
+    except Exception as e:
+        console.print(f"[red]❌ Error de conexión: {e}[/red]")
+        return False
+
+
+def create_postgres_from_sql(
+    sql_file: str, table_name: str, credentials: Dict[str, str], max_inserts: int = 0
+) -> bool:
+    """
+    Crea tabla e inserta datos en PostgreSQL ejecutando el archivo SQL generado.
+    max_inserts: número máximo de INSERT statements a procesar (0 = todos).
+    Retorna True si fue exitoso.
+    """
+    console.print(
+        f"[cyan]🐘 Creando tabla y datos en PostgreSQL: {credentials['database']}[/cyan]"
+    )
+
+    try:
+        # Conectar a PostgreSQL
+        conn = psycopg2.connect(**credentials)
+        conn.autocommit = False  # Usar transacciones manuales
+        cursor = conn.cursor()
+
+        # Leer el archivo SQL
+        with open(sql_file, "r", encoding="utf-8") as f:
+            sql_content = f.read()
+
+        # Dividir en CREATE TABLE e INSERTs
+        create_match = re.search(
+            r"(CREATE TABLE.*?;)", sql_content, re.IGNORECASE | re.DOTALL
+        )
+
+        if not create_match:
+            console.print("[red]❌ No se encontró CREATE TABLE en el archivo[/red]")
+            return False
+
+        create_sql = create_match.group(1)
+
+        # Ejecutar CREATE TABLE
+        console.print("[cyan]📋 Creando tabla...[/cyan]")
+
+        # Agregar DROP TABLE IF EXISTS para evitar conflictos
+        drop_sql = f"DROP TABLE IF EXISTS {table_name};"
+        cursor.execute(drop_sql)
+        cursor.execute(create_sql)
+
+        # Procesar INSERTs
+        insert_pattern = r"INSERT INTO \w+ VALUES \([^)]+\);"
+        inserts = re.findall(insert_pattern, sql_content, re.IGNORECASE)
+
+        total_inserts = len(inserts)
+        if max_inserts > 0 and max_inserts < total_inserts:
+            inserts = inserts[:max_inserts]
+            console.print(
+                f"[yellow]⚠️ Limitando a {max_inserts} de {total_inserts} registros[/yellow]"
+            )
+
+        console.print(f"[cyan]📊 Insertando {len(inserts)} registros...[/cyan]")
+
+        # Progreso de inserción
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Insertando datos...", total=len(inserts))
+
+            batch_size = 1000
+            for i in range(0, len(inserts), batch_size):
+                batch = inserts[i : i + batch_size]
+
+                for insert_sql in batch:
+                    cursor.execute(insert_sql)
+
+                # Commit cada batch
+                conn.commit()
+                progress.update(task, advance=len(batch))
+
+        # Verificar datos insertados
+        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        count = cursor.fetchone()[0]
+
+        console.print(f"[green]✅ Base de datos PostgreSQL creada exitosamente[/green]")
+        console.print(f"[cyan]📊 Registros insertados: {count:,}[/cyan]")
+        console.print(f"[cyan]🗄️ Tabla: {table_name}[/cyan]")
+        console.print(
+            f"[cyan]🔗 Host: {credentials['host']}:{credentials['port']}/{credentials['database']}[/cyan]"
+        )
+
+        conn.close()
+        return True
+
+    except Exception as e:
+        console.print(f"[red]❌ Error creando base de datos PostgreSQL: {e}[/red]")
+        if "conn" in locals():
+            conn.rollback()
+            conn.close()
+        return False
 
 
 def create_sqlite_from_sql(
@@ -712,12 +966,13 @@ def main():
             "[cyan]Buscando INSERT statements y VALUES en el archivo original...[/cyan]"
         )
         column_names = [col[0] for col in edited_columns]
+        column_types = [col[1] for col in edited_columns]
 
         # Crear lista de índices de columnas que se mantuvieron (0-based)
         kept_indices = [i for i in range(len(columns)) if i not in indices_to_remove]
 
         insert_sql = extract_insert_statements(
-            sql_text, new_table_name, column_names, 0, kept_indices
+            sql_text, new_table_name, column_names, 0, kept_indices, column_types
         )
 
         if insert_sql.strip():  # Solo escribir si encontramos INSERT statements
@@ -757,18 +1012,41 @@ def main():
                     f"[green]Archivo final con CREATE + INSERTs: {out_file}[/green]"
                 )
 
-    # Preguntar si quiere crear base de datos SQLite
+    # Menú de selección de base de datos
     console.print("\n" + "=" * 80)
     console.print(
         Panel(
-            "¿Deseas crear una base de datos SQLite y ejecutar las migraciones?\n"
-            "Esto creará un archivo .db listo para usar con todos los datos importados.",
-            title="🗄️ Crear Base de Datos SQLite",
+            "¿Deseas crear una base de datos para importar los datos?\n"
+            "Puedes elegir entre SQLite (archivo local) o PostgreSQL (servidor).",
+            title="🗄️ Crear Base de Datos",
             border_style="cyan",
         )
     )
 
-    if Confirm.ask("¿Crear base de datos SQLite con los datos?", default=True):
+    # Preparar opciones del menú
+    db_options = [
+        ("📄 SQLite", "Local - Crear archivo .db (recomendado para pruebas)"),
+        ("🐘 PostgreSQL", "Servidor - Conectar a PostgreSQL (producción)"),
+        ("❌ Ninguna", "Solo generar archivo SQL"),
+    ]
+
+    # Si PostgreSQL no está disponible, agregar nota
+    if not POSTGRES_AVAILABLE:
+        db_options[1] = (
+            "🐘 PostgreSQL [DESHABILITADO]",
+            "Requiere: pip install psycopg2-binary",
+        )
+
+    # Mostrar menú
+    choices = [f"{option[0]} - {option[1]}" for option in db_options]
+
+    selected = inquirer.list_input(
+        "Selecciona el tipo de base de datos:", choices=choices
+    )
+
+    # Procesar selección
+    if "SQLite" in selected:
+        # Opción SQLite
         sqlite_file = create_sqlite_from_sql(out_file, new_table_name)
         if sqlite_file:
             console.print(f"\n[green]🎉 ¡Base de datos SQLite lista![/green]")
@@ -776,6 +1054,44 @@ def main():
             console.print(f"[dim]Puedes usar: sqlite3 {sqlite_file}[/dim]")
         else:
             console.print("[red]❌ No se pudo crear la base de datos SQLite[/red]")
+
+    elif "PostgreSQL" in selected and POSTGRES_AVAILABLE:
+        # Opción PostgreSQL
+        credentials = get_postgres_credentials()
+
+        # Probar conexión
+        if test_postgres_connection(credentials):
+            # Preguntar por límite de registros para pruebas
+            if Confirm.ask(
+                "¿Deseas limitar el número de registros para pruebas?", default=False
+            ):
+                max_records = IntPrompt.ask("Número máximo de registros", default=1000)
+            else:
+                max_records = 0
+
+            # Crear base de datos
+            success = create_postgres_from_sql(
+                out_file, new_table_name, credentials, max_records
+            )
+            if success:
+                console.print(f"\n[green]🎉 ¡Base de datos PostgreSQL lista![/green]")
+            else:
+                console.print(
+                    "[red]❌ No se pudo crear la base de datos PostgreSQL[/red]"
+                )
+        else:
+            console.print(
+                "[red]❌ No se pudo conectar a PostgreSQL. Verifica las credenciales.[/red]"
+            )
+
+    elif "PostgreSQL" in selected and not POSTGRES_AVAILABLE:
+        # PostgreSQL no disponible
+        console.print("[yellow]⚠️ PostgreSQL no está disponible.[/yellow]")
+        console.print("[dim]Instala con: pip install psycopg2-binary[/dim]")
+
+    else:
+        # Solo archivo SQL
+        console.print("[cyan]📄 Solo se generó el archivo SQL corregido.[/cyan]")
 
     console.print("\n🎉 Proceso finalizado.")
 
