@@ -115,19 +115,8 @@ class CSVToSQLConverter:
         Returns:
             str: SQL CREATE TABLE statement
         """
-        columns_sql = []
-        for column, data_type in column_types.items():
-            columns_sql.append(f"    {column} {data_type}")
-
-        create_sql = f"""-- Crear tabla {self.table_name}
-DROP TABLE IF EXISTS {self.table_name};
-
-CREATE TABLE {self.table_name} (
-{",{}".format(chr(10)).join(columns_sql)}
-);
-
-"""
-        return create_sql
+        # No generar CREATE TABLE ni DROP TABLE, solo comentario
+        return f"-- Tabla: {self.table_name}\n\n"
 
     def convert_to_sql(self, chunk_size: int = 1000, max_rows: int = None) -> str:
         """
