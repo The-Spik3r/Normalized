@@ -23,7 +23,7 @@ from rich.progress import (
     TaskProgressColumn,
 )
 from rich.prompt import Prompt, Confirm
-from typing import Dict
+from typing import Dict, List
 from datetime import datetime
 
 from csv_to_sql import CSVToSQLConverter
@@ -313,6 +313,7 @@ class InteractiveCSVConverter:
         self.column_mapping = {}
         self.type_mapping = {}
         self.sample_df = None
+        self.excluded_columns = []
 
     def show_welcome(self):
         """Muestra la pantalla de bienvenida para conversión CSV"""
@@ -614,6 +615,9 @@ class InteractiveCSVConverter:
             excluded_columns.append(original_name)
 
         if excluded_columns:
+            # Guardar las columnas excluidas para usarlas durante el procesamiento completo
+            self.excluded_columns = excluded_columns
+
             # Actualizar el DataFrame para excluir las columnas seleccionadas
             self.sample_df = self.sample_df.drop(columns=excluded_columns)
 
@@ -1046,7 +1050,11 @@ class InteractiveCSVConverter:
 
         # Crear convertidor personalizado
         converter = CustomCSVToSQLConverter(
-            self.csv_file, self.table_name, self.column_mapping, self.type_mapping
+            self.csv_file,
+            self.table_name,
+            self.column_mapping,
+            self.type_mapping,
+            self.excluded_columns,
         )
 
         # Mostrar progreso con animación
@@ -1154,10 +1162,12 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
         table_name: str,
         column_mapping: Dict[str, str],
         type_mapping: Dict[str, str],
+        excluded_columns: List[str] = None,
     ):
         super().__init__(csv_file_path, table_name)
         self.column_mapping = column_mapping
         self.type_mapping = type_mapping
+        self.excluded_columns = excluded_columns or []
         self.error_count = 0
         self.skipped_lines = []
 
@@ -1272,15 +1282,24 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
             # Leer muestra para crear estructura (con manejo de errores)
             sample_df = pd.read_csv(self.csv_file_path, nrows=1000, on_bad_lines="skip")
 
-            # Aplicar mapeo de columnas
+            # Aplicar exclusión de columnas primero
+            if self.excluded_columns:
+                columns_to_keep = [
+                    col for col in sample_df.columns if col not in self.excluded_columns
+                ]
+                sample_df = sample_df[columns_to_keep]
+
+            # Aplicar mapeo de columnas solo a las columnas restantes
+            remaining_columns = list(sample_df.columns)
             sample_df.columns = [
-                self.column_mapping.get(col, col) for col in sample_df.columns
+                self.column_mapping.get(col, col) for col in remaining_columns
             ]
 
-            # Obtener tipos personalizados
+            # Obtener tipos personalizados solo para las columnas que no fueron excluidas
             column_types = {}
             for original_col, new_col in self.column_mapping.items():
-                column_types[new_col] = self.type_mapping[original_col]
+                if original_col not in self.excluded_columns:
+                    column_types[new_col] = self.type_mapping[original_col]
 
             # Crear archivo SQL
             with open(self.sql_file_path, "w", encoding="utf-8") as sql_file:
@@ -1302,11 +1321,26 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
 
                 # Usar iterador robusto que maneja errores
                 try:
+                    # Determinar qué columnas leer (excluir las columnas seleccionadas por el usuario)
+                    if self.excluded_columns:
+                        # Leer todas las columnas primero para saber cuáles excluir
+                        all_columns = pd.read_csv(
+                            self.csv_file_path, nrows=0
+                        ).columns.tolist()
+                        columns_to_read = [
+                            col
+                            for col in all_columns
+                            if col not in self.excluded_columns
+                        ]
+                    else:
+                        columns_to_read = None  # Leer todas las columnas
+
                     chunk_iterator = pd.read_csv(
                         self.csv_file_path,
                         chunksize=chunk_size,
                         on_bad_lines="skip",  # Saltar líneas malformadas
                         dtype=str,  # Leer todo como string para evitar errores de tipo
+                        usecols=columns_to_read,  # Solo leer las columnas que no fueron excluidas
                     )
 
                     for chunk_df in chunk_iterator:
@@ -1316,7 +1350,13 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
                             break
 
                         # Validar que el chunk tenga el número correcto de columnas
-                        expected_cols = len(self.column_mapping)
+                        expected_cols = len(
+                            [
+                                col
+                                for col in self.column_mapping.keys()
+                                if col not in self.excluded_columns
+                            ]
+                        )
                         if len(chunk_df.columns) != expected_cols:
                             logging.warning(
                                 f"Chunk {total_chunks}: Esperado {expected_cols} columnas, encontrado {len(chunk_df.columns)}"
@@ -1324,7 +1364,6 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
                             # Ajustar columnas si es necesario
                             if len(chunk_df.columns) < expected_cols:
                                 # Añadir columnas faltantes con None
-                                original_cols = list(self.column_mapping.keys())
                                 for i in range(len(chunk_df.columns), expected_cols):
                                     chunk_df[f"missing_col_{i}"] = None
                             else:
@@ -1333,11 +1372,25 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
 
                         # Aplicar mapeo de columnas de forma segura
                         try:
-                            original_cols = list(self.column_mapping.keys())
-                            chunk_df.columns = [
-                                self.column_mapping.get(original_cols[i], f"col_{i}")
-                                for i in range(len(chunk_df.columns))
+                            # Obtener solo las columnas originales que no fueron excluidas
+                            original_cols_remaining = [
+                                col
+                                for col in self.column_mapping.keys()
+                                if col not in self.excluded_columns
                             ]
+                            # Aplicar el mapeo usando las columnas reales del chunk
+                            new_column_names = []
+                            for i, actual_col in enumerate(chunk_df.columns):
+                                if i < len(original_cols_remaining):
+                                    original_col = original_cols_remaining[i]
+                                    new_name = self.column_mapping.get(
+                                        original_col, f"col_{i}"
+                                    )
+                                    new_column_names.append(new_name)
+                                else:
+                                    new_column_names.append(f"col_{i}")
+
+                            chunk_df.columns = new_column_names
                         except Exception as e:
                             logging.warning(
                                 f"Error en mapeo de columnas en chunk {total_chunks}: {e}"
