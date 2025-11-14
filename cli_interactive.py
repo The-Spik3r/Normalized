@@ -30,6 +30,15 @@ from csv_to_sql import CSVToSQLConverter
 
 console = Console()
 
+# Configurar logging para debug
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+
 # Importar funciones de reparación SQL
 try:
     from sql_repair_fixed import (
@@ -45,6 +54,64 @@ try:
     SQL_REPAIR_AVAILABLE = True
 except ImportError:
     SQL_REPAIR_AVAILABLE = False
+
+
+def detect_header(csv_path: str) -> int | None:
+    """
+    Detecta si un CSV tiene header.
+
+    Regla simple pero efectiva:
+    - Si la primera fila contiene '@', 'http', '.com', es un dato → header=None.
+    - Si la primera fila parece texto o nombres, se asume header=0.
+
+    Args:
+        csv_path: Ruta al archivo CSV
+
+    Returns:
+        None si no hay header, 0 si hay header
+    """
+    try:
+        with open(csv_path, "r", encoding="utf-8-sig", errors="ignore") as f:
+            first_line = f.readline().strip()
+
+        # Log para debug
+        logging.info(f"Primera línea del CSV (primeros 200 chars): {first_line[:200]}")
+
+        # Limpiar posible BOM o espacios
+        first_line = first_line.lstrip('\ufeff').strip()
+
+        # Heurística mejorada para detectar si el primer campo es dato o no
+        indicators_of_data = [
+            "@",           # Email
+            "http://",     # URL
+            "https://",    # URL
+            ".com",        # Dominio
+            ".net",        # Dominio
+            ".org",        # Dominio
+            "linkedin.com", # LinkedIn específico
+            "/in/",        # LinkedIn profile path
+            "www.",        # URL
+        ]
+
+        first_line_lower = first_line.lower()
+
+        # Contar cuántos indicadores encontramos
+        matches = sum(1 for indicator in indicators_of_data if indicator in first_line_lower)
+
+        logging.info(f"Indicadores de datos encontrados: {matches}")
+
+        # Si encontramos al menos un indicador fuerte, es un dato (no header)
+        if matches > 0:
+            logging.info("CSV sin header detectado (contiene indicadores de datos)")
+            console.print("[cyan]ℹ️  Detectado: CSV sin header. Los nombres de columnas se generarán automáticamente.[/cyan]")
+            return None  # No hay header
+
+        logging.info("CSV con header detectado (primera fila parece ser nombres de columnas)")
+        return 0  # Sí hay header
+
+    except Exception as e:
+        logging.warning(f"Error detectando header, asumiendo header=0: {e}")
+        return 0  # Default a header presente si hay error
 
 
 def sanitize_name(name: str) -> str:
@@ -142,6 +209,66 @@ def sanitize_international_names_batch(names_series: pd.Series) -> pd.Series:
         Serie de pandas con nombres sanitizados
     """
     return names_series.apply(sanitize_name)
+
+
+def extract_name_from_linkedin_url(url: str) -> str:
+    """
+    Extrae el nombre de una URL de LinkedIn
+
+    Args:
+        url: URL de LinkedIn (ej: linkedin.com/in/john-doe-12345)
+
+    Returns:
+        Nombre extraído y formateado (ej: "john doe")
+    """
+    if pd.isna(url) or not url:
+        return None
+
+    try:
+        url = str(url).strip()
+
+        # Buscar el patrón /in/ en la URL
+        if "/in/" in url:
+            # Extraer la parte después de /in/
+            parts = url.split("/in/")
+            if len(parts) >= 2:
+                profile_slug = parts[1]
+
+                # Remover cualquier cosa después de otro /
+                profile_slug = profile_slug.split("/")[0]
+
+                # Remover IDs al final (pueden ser solo números o mezcla de números y letras)
+                # Ejemplos: -12345, -49020416, -88764a50, -ba555320
+                # Patrón: guion seguido de números/letras (que parecen IDs) al final
+                import re
+                profile_slug = re.sub(r'-[a-z0-9]+$', '', profile_slug)
+
+                # Reemplazar guiones por espacios
+                name = profile_slug.replace("-", " ")
+
+                # Limpiar espacios múltiples
+                name = " ".join(name.split())
+
+                return name.strip() if name else None
+
+        return None
+
+    except Exception as e:
+        logging.warning(f"Error extrayendo nombre de URL {url}: {e}")
+        return None
+
+
+def extract_names_from_linkedin_batch(urls_series: pd.Series) -> pd.Series:
+    """
+    Extrae nombres desde una serie de URLs de LinkedIn
+
+    Args:
+        urls_series: Serie de pandas con URLs de LinkedIn
+
+    Returns:
+        Serie de pandas con nombres extraídos
+    """
+    return urls_series.apply(extract_name_from_linkedin_url)
 
 
 def sql_repair_mode():
@@ -314,6 +441,7 @@ class InteractiveCSVConverter:
         self.type_mapping = {}
         self.sample_df = None
         self.excluded_columns = []
+        self.linkedin_columns_map = {}  # Mapeo de columna LinkedIn → columna de nombre extraído
 
     def show_welcome(self):
         """Muestra la pantalla de bienvenida para conversión CSV"""
@@ -407,8 +535,24 @@ class InteractiveCSVConverter:
 
         with console.status("[bold green]Analizando archivo CSV..."):
             try:
+                # Detectar si el CSV tiene header
+                header_option = detect_header(self.csv_file)
+
                 # Leer muestra del archivo
-                self.sample_df = pd.read_csv(self.csv_file, nrows=1000)
+                self.sample_df = pd.read_csv(
+                    self.csv_file,
+                    nrows=1000,
+                    header=header_option,
+                    on_bad_lines="skip",
+                    dtype=str
+                )
+
+                # Si no hay header, Pandas asigna nombres numéricos (0, 1, 2...)
+                # Los convertimos a nombres descriptivos
+                if header_option is None:
+                    new_columns = [f"col_{i}" for i in range(len(self.sample_df.columns))]
+                    self.sample_df.columns = new_columns
+
                 time.sleep(0.5)  # Para mostrar la animación
 
             except Exception as e:
@@ -452,7 +596,80 @@ class InteractiveCSVConverter:
         if len(self.sample_df.columns) > 5:
             console.print(f"... y {len(self.sample_df.columns) - 5} columnas más")
 
+        # Detectar si hay columnas de LinkedIn y ofrecer extraer nombres
+        self._detect_and_offer_linkedin_extraction()
+
         return True
+
+    def _detect_and_offer_linkedin_extraction(self):
+        """Detecta columnas de LinkedIn y ofrece extraer nombres"""
+        linkedin_columns = []
+
+        # Buscar columnas que contengan URLs de LinkedIn
+        for col in self.sample_df.columns:
+            # Revisar las primeras filas de cada columna
+            sample_values = self.sample_df[col].dropna().head(10).astype(str)
+            if any("linkedin.com/in/" in str(val).lower() for val in sample_values):
+                linkedin_columns.append(col)
+
+        if linkedin_columns:
+            console.print(
+                f"\n[bold yellow]🔍 Detecté {len(linkedin_columns)} columna(s) con URLs de LinkedIn:[/bold yellow]"
+            )
+            for col in linkedin_columns:
+                console.print(f"   • {col}")
+
+            console.print(
+                "\n[cyan]💡 Puedo extraer los NOMBRES desde estas URLs automáticamente.[/cyan]"
+            )
+            console.print(
+                "[dim]Ejemplo: 'linkedin.com/in/john-doe-12345' → 'john doe'[/dim]\n"
+            )
+
+            if Confirm.ask(
+                "¿Deseas agregar columna(s) con nombres extraídos de LinkedIn?",
+                default=True,
+            ):
+                for linkedin_col in linkedin_columns:
+                    # Generar nombre para la nueva columna
+                    new_col_name = f"{linkedin_col}_name"
+
+                    # Guardar el mapeo para usarlo durante la conversión completa
+                    self.linkedin_columns_map[linkedin_col] = new_col_name
+
+                    # Extraer nombres en la muestra
+                    with console.status(
+                        f"[bold green]Extrayendo nombres desde {linkedin_col}..."
+                    ):
+                        self.sample_df[new_col_name] = extract_names_from_linkedin_batch(
+                            self.sample_df[linkedin_col]
+                        )
+                        time.sleep(0.3)
+
+                    # Mostrar algunos ejemplos
+                    console.print(
+                        f"\n[green]✅ Columna '{new_col_name}' creada exitosamente[/green]"
+                    )
+                    console.print("[bold]Ejemplos de nombres extraídos:[/bold]")
+
+                    examples_table = Table(show_header=True, box=None)
+                    examples_table.add_column("URL Original", style="yellow", width=40)
+                    examples_table.add_column("Nombre Extraído", style="green")
+
+                    for i in range(min(3, len(self.sample_df))):
+                        url = str(self.sample_df[linkedin_col].iloc[i])[:40] + "..."
+                        name = self.sample_df[new_col_name].iloc[i]
+                        examples_table.add_row(url, str(name) if name else "[dim]N/A[/dim]")
+
+                    console.print(examples_table)
+
+                console.print(
+                    f"\n[bold green]🎉 Se agregaron {len(linkedin_columns)} columna(s) de nombres![/bold green]"
+                )
+            else:
+                console.print(
+                    "[dim]No se agregarán columnas de nombres. Continuando...[/dim]"
+                )
 
     def count_total_rows(self) -> int:
         """Cuenta el total de filas en el archivo CSV (excluyendo el header)"""
@@ -1055,6 +1272,7 @@ class InteractiveCSVConverter:
             self.column_mapping,
             self.type_mapping,
             self.excluded_columns,
+            self.linkedin_columns_map,
         )
 
         # Mostrar progreso con animación
@@ -1163,11 +1381,13 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
         column_mapping: Dict[str, str],
         type_mapping: Dict[str, str],
         excluded_columns: List[str] = None,
+        linkedin_columns_map: Dict[str, str] = None,
     ):
         super().__init__(csv_file_path, table_name)
         self.column_mapping = column_mapping
         self.type_mapping = type_mapping
         self.excluded_columns = excluded_columns or []
+        self.linkedin_columns_map = linkedin_columns_map or {}  # Mapeo: col_linkedin → col_nombre
         self.error_count = 0
         self.skipped_lines = []
 
@@ -1279,8 +1499,22 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
         self.skipped_lines = []
 
         try:
+            # Detectar si el CSV tiene header
+            header_option = detect_header(self.csv_file_path)
+
             # Leer muestra para crear estructura (con manejo de errores)
-            sample_df = pd.read_csv(self.csv_file_path, nrows=1000, on_bad_lines="skip")
+            sample_df = pd.read_csv(
+                self.csv_file_path,
+                nrows=1000,
+                header=header_option,
+                on_bad_lines="skip",
+                dtype=str
+            )
+
+            # Si no hay header, renombrar columnas numéricas a nombres descriptivos
+            if header_option is None:
+                sample_df.columns = [f"col_{i}" for i in range(len(sample_df.columns))]
+                logging.info("CSV sin header detectado. Nombres de columnas generados automáticamente.")
 
             # Aplicar exclusión de columnas primero
             if self.excluded_columns:
@@ -1295,11 +1529,28 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
                 self.column_mapping.get(col, col) for col in remaining_columns
             ]
 
+            # Extraer nombres de LinkedIn en la muestra si están configurados
+            if self.linkedin_columns_map:
+                for linkedin_col, name_col in self.linkedin_columns_map.items():
+                    mapped_linkedin_col = self.column_mapping.get(linkedin_col, linkedin_col)
+                    if mapped_linkedin_col in sample_df.columns:
+                        sample_df[name_col] = extract_names_from_linkedin_batch(
+                            sample_df[mapped_linkedin_col]
+                        )
+                        logging.info(f"Columna '{name_col}' agregada desde '{mapped_linkedin_col}'")
+
             # Obtener tipos personalizados solo para las columnas que no fueron excluidas
             column_types = {}
             for original_col, new_col in self.column_mapping.items():
                 if original_col not in self.excluded_columns:
                     column_types[new_col] = self.type_mapping[original_col]
+
+            # Agregar columnas de nombres extraídos de LinkedIn
+            if self.linkedin_columns_map:
+                for linkedin_col, name_col in self.linkedin_columns_map.items():
+                    # Agregar la columna de nombre con tipo VARCHAR(255)
+                    column_types[name_col] = "VARCHAR(255)"
+                logging.info(f"Columnas de nombres desde LinkedIn agregadas: {list(self.linkedin_columns_map.values())}")
 
             # Crear archivo SQL
             with open(self.sql_file_path, "w", encoding="utf-8") as sql_file:
@@ -1324,9 +1575,18 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
                     # Determinar qué columnas leer (excluir las columnas seleccionadas por el usuario)
                     if self.excluded_columns:
                         # Leer todas las columnas primero para saber cuáles excluir
-                        all_columns = pd.read_csv(
-                            self.csv_file_path, nrows=0
-                        ).columns.tolist()
+                        temp_df = pd.read_csv(
+                            self.csv_file_path,
+                            nrows=0,
+                            header=header_option,
+                            on_bad_lines="skip",
+                            dtype=str
+                        )
+                        # Si no hay header, renombrar columnas
+                        if header_option is None:
+                            temp_df.columns = [f"col_{i}" for i in range(len(temp_df.columns))]
+
+                        all_columns = temp_df.columns.tolist()
                         columns_to_read = [
                             col
                             for col in all_columns
@@ -1338,6 +1598,7 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
                     chunk_iterator = pd.read_csv(
                         self.csv_file_path,
                         chunksize=chunk_size,
+                        header=header_option,
                         on_bad_lines="skip",  # Saltar líneas malformadas
                         dtype=str,  # Leer todo como string para evitar errores de tipo
                         usecols=columns_to_read,  # Solo leer las columnas que no fueron excluidas
@@ -1348,6 +1609,10 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
 
                         if max_rows and processed_rows >= max_rows:
                             break
+
+                        # Si no hay header, renombrar columnas numéricas a nombres descriptivos
+                        if header_option is None:
+                            chunk_df.columns = [f"col_{i}" for i in range(len(chunk_df.columns))]
 
                         # Validar que el chunk tenga el número correcto de columnas
                         expected_cols = len(
@@ -1399,6 +1664,17 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
                             chunk_df.columns = [
                                 f"col_{i}" for i in range(len(chunk_df.columns))
                             ]
+
+                        # Extraer nombres desde URLs de LinkedIn si están configuradas
+                        if self.linkedin_columns_map:
+                            for linkedin_col, name_col in self.linkedin_columns_map.items():
+                                # Verificar que la columna de LinkedIn esté en el chunk
+                                mapped_linkedin_col = self.column_mapping.get(linkedin_col, linkedin_col)
+                                if mapped_linkedin_col in chunk_df.columns:
+                                    # Extraer nombres
+                                    chunk_df[name_col] = extract_names_from_linkedin_batch(
+                                        chunk_df[mapped_linkedin_col]
+                                    )
 
                         # Procesar filas con manejo individual de errores
                         for idx, row in chunk_df.iterrows():
