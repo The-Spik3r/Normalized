@@ -283,6 +283,43 @@ def ask_processing_option(total_values: int) -> int:
                 console.print("[red]⚠️ Debe ser un número válido[/red]")
 
 
+def ask_output_method() -> bool:
+    """
+    Pregunta al usuario si quiere generar INSERT statements o COPY statement.
+    Retorna True para COPY, False para INSERT.
+    """
+    console.print("\n" + "=" * 60)
+    console.print(
+        Panel(
+            "Elige el método de salida para los datos:\n\n"
+            "• INSERT: Statements individuales (compatible universalmente)\n"
+            "• COPY: Statement único con datos incrustados (PostgreSQL, mucho más rápido)",
+            title="🚀 Método de Salida",
+            border_style="cyan",
+        )
+    )
+
+    method_options = [
+        "📝 INSERT statements (compatible universalmente)",
+        "🚀 COPY statement (PostgreSQL, súper rápido - recomendado)",
+    ]
+
+    method_choice = inquirer.list_input("Selecciona el método:", choices=method_options)
+
+    use_copy = "COPY" in method_choice
+
+    if use_copy:
+        console.print(
+            "[green]✅ Usando COPY statement - Optimizado para velocidad[/green]"
+        )
+    else:
+        console.print(
+            "[blue]✅ Usando INSERT statements - Máxima compatibilidad[/blue]"
+        )
+
+    return use_copy
+
+
 def sanitize_sql_value(value: str) -> str:
     """
     Sanitiza un valor individual para uso seguro en SQL (versión genérica).
@@ -538,6 +575,253 @@ def extract_insert_statements(
     )
 
     return "\n".join(insert_statements)
+
+
+def extract_copy_statement(
+    sql_text: str,
+    table_name: str,
+    column_names: List[str],
+    max_values: int = 0,
+    kept_indices: List[int] = None,
+    column_types: List[str] = None,
+) -> str:
+    """
+    Extrae VALUES y los convierte a COPY statement con datos incrustados.
+    Mucho más rápido que INSERT statements individuales.
+    """
+    console.print("[cyan]🚀 Generando COPY statement desde VALUES...[/cyan]")
+
+    # Usar la misma lógica base para extraer datos
+    all_values = []
+
+    # Buscar VALUES sueltos (no dentro de INSERT) - Patrón original
+    values_pattern = r"VALUES\s*\((.*?)\)(?:\s*,\s*\((.*?)\))*"
+    values_blocks = re.findall(
+        values_pattern, sql_text, re.IGNORECASE | re.MULTILINE | re.DOTALL
+    )
+
+    # Buscar INSERT statements existentes - Patrón original
+    insert_pattern = r"INSERT\s+INTO\s+\w+\s*(?:\([^)]+\))?\s*VALUES\s*\((.*?)\)(?:\s*,\s*\((.*?)\))*"
+    insert_blocks = re.findall(
+        insert_pattern, sql_text, re.IGNORECASE | re.MULTILINE | re.DOTALL
+    )
+
+    # NUEVO: Buscar tuplas sueltas (líneas que empiezan con tab y paréntesis)
+    # Este patrón maneja archivos como el test_sample.sql
+    lines = sql_text.split("\n")
+    tuple_lines = []
+    for line in lines:
+        # Buscar líneas que empiecen con espacios/tabs y un paréntesis
+        # EXCLUIR líneas con backticks (que son headers de columna)
+        if re.match(r"\s*\([^)]+\),?\s*$", line.strip()) and "`" not in line:
+            tuple_lines.append(line.strip())
+
+    total_processed = 0
+
+    # Procesar tuplas sueltas (NUEVO - para archivos como test_sample.sql)
+    console.print(f"[dim]Encontradas {len(tuple_lines)} tuplas sueltas...[/dim]")
+    for line in tuple_lines:
+        if max_values > 0 and total_processed >= max_values:
+            break
+
+        # Remover paréntesis y coma final
+        line_clean = line.strip()
+        if line_clean.endswith(","):
+            line_clean = line_clean[:-1]
+        if line_clean.startswith("(") and line_clean.endswith(")"):
+            line_clean = line_clean[1:-1]  # Remover paréntesis
+
+        # Parsear valores individuales
+        values = parse_values_string(line_clean)
+
+        # Filtrar por índices si se especificaron
+        if kept_indices is not None:
+            values = [values[i] if i < len(values) else "NULL" for i in kept_indices]
+
+        # Limpiar y convertir valores a formato COPY
+        clean_values = []
+        for j, value in enumerate(values):
+            col_type = (
+                column_types[j] if column_types and j < len(column_types) else None
+            )
+            clean_value = sanitize_value_for_copy(value, col_type)
+            clean_values.append(clean_value)
+
+        all_values.append(clean_values)
+        total_processed += 1
+
+    # Procesar VALUES sueltos (patrón original)
+    for match in values_blocks:
+        if max_values > 0 and total_processed >= max_values:
+            break
+        values_text = "(" + match[0] + ")"
+        if match[1]:  # Hay múltiples VALUES
+            values_text += ", (" + match[1] + ")"
+
+        # Extraer individual VALUES
+        individual_values = re.findall(r"\((.*?)\)", values_text)
+        for value_str in individual_values:
+            if max_values > 0 and total_processed >= max_values:
+                break
+
+            # Parsear valores individuales
+            values = parse_values_string(value_str)
+
+            # Filtrar por índices si se especificaron
+            if kept_indices is not None:
+                values = [
+                    values[i] if i < len(values) else "NULL" for i in kept_indices
+                ]
+
+            # Limpiar y convertir valores a formato COPY
+            clean_values = []
+            for j, value in enumerate(values):
+                col_type = (
+                    column_types[j] if column_types and j < len(column_types) else None
+                )
+                clean_value = sanitize_value_for_copy(value, col_type)
+                clean_values.append(clean_value)
+
+            all_values.append(clean_values)
+            total_processed += 1
+
+    # Procesar INSERT statements existentes
+    for match in insert_blocks:
+        if max_values > 0 and total_processed >= max_values:
+            break
+        values_text = "(" + match[0] + ")"
+        if match[1]:
+            values_text += ", (" + match[1] + ")"
+
+        individual_values = re.findall(r"\((.*?)\)", values_text)
+        for value_str in individual_values:
+            if max_values > 0 and total_processed >= max_values:
+                break
+
+            values = parse_values_string(value_str)
+
+            if kept_indices is not None:
+                values = [
+                    values[i] if i < len(values) else "NULL" for i in kept_indices
+                ]
+
+            clean_values = []
+            for j, value in enumerate(values):
+                col_type = (
+                    column_types[j] if column_types and j < len(column_types) else None
+                )
+                clean_value = sanitize_value_for_copy(value, col_type)
+                clean_values.append(clean_value)
+
+            all_values.append(clean_values)
+            total_processed += 1
+
+    if not all_values:
+        console.print(
+            "[yellow]⚠️ No se encontraron VALUES para convertir a COPY[/yellow]"
+        )
+        return ""
+
+    # Generar COPY statement
+    columns_str = ",\n    ".join(column_names)
+    copy_sql = f"""-- COPY statement generado desde VALUES existentes
+COPY {table_name} (
+    {columns_str}
+) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', NULL '\\\\N');
+"""
+
+    # Agregar datos
+    data_lines = []
+    for values in all_values:
+        # Unir valores con tabs (formato COPY)
+        data_line = "\t".join(values)
+        data_lines.append(data_line)
+
+    copy_sql += "\n".join(data_lines)
+    copy_sql += "\n\\.\n"  # Terminar COPY
+
+    console.print(
+        f"[green]✓ COPY statement generado con {len(all_values):,} filas[/green]"
+    )
+    return copy_sql
+
+
+def sanitize_value_for_copy(value: str, column_type: str = None) -> str:
+    """
+    Sanitiza un valor para formato COPY CSV (usa \\N para NULL, valores con comillas simples)
+    """
+    # Primero verificar si el valor original es NULL
+    if not value or value.strip() == "":
+        return "\\N"
+
+    # Remover comillas externas si las hay para verificar el contenido
+    clean_value = value.strip()
+    if (clean_value.startswith("'") and clean_value.endswith("'")) or (
+        clean_value.startswith('"') and clean_value.endswith('"')
+    ):
+        clean_value = clean_value[1:-1]
+
+    # Verificar si el contenido limpio es NULL (incluyendo 'null' con comillas)
+    if clean_value.upper() in ("NULL", "NONE", ""):
+        return "\\N"
+
+    # Si llegamos aquí, es un valor válido - usar el valor limpio sin comillas externas
+    value = clean_value
+
+    # Escapar comillas simples dentro del valor (doblarlas para CSV)
+    value = value.replace("'", "''")
+
+    # Escapar caracteres especiales para COPY CSV
+    value = value.replace("\\", "\\\\")  # Backslashes
+    value = value.replace("\t", "\\t")  # Tabs
+    value = value.replace("\n", "\\n")  # Newlines
+    value = value.replace("\r", "\\r")  # Carriage returns
+
+    # Envolver en comillas simples para formato CSV
+    return f"'{value}'"
+
+
+def parse_values_string(values_str: str) -> List[str]:
+    """
+    Parsea una cadena de valores separados por comas, manejando comillas y escapado.
+    """
+    values = []
+    current_value = ""
+    in_quotes = False
+    quote_char = None
+    i = 0
+
+    while i < len(values_str):
+        char = values_str[i]
+
+        if not in_quotes:
+            if char in ("'", '"'):
+                in_quotes = True
+                quote_char = char
+                current_value += char
+            elif char == ",":
+                values.append(current_value.strip())
+                current_value = ""
+            else:
+                current_value += char
+        else:
+            current_value += char
+            if char == quote_char:
+                # Verificar si es escape (doble comilla)
+                if i + 1 < len(values_str) and values_str[i + 1] == quote_char:
+                    current_value += quote_char
+                    i += 1  # Saltar la segunda comilla
+                else:
+                    in_quotes = False
+                    quote_char = None
+
+        i += 1
+
+    # Agregar último valor
+    if current_value.strip():
+        values.append(current_value.strip())
+
+    return values
 
 
 def try_generate_inserts_from_csv(
@@ -961,7 +1245,7 @@ def main():
         corrected_sql = build_create_table_sql(new_table_name, edited_columns)
         f.write(corrected_sql)
 
-        # Siempre buscar y generar INSERTs desde VALUES existentes o INSERT statements
+        # Verificar si hay datos para procesar
         console.print(
             "[cyan]Buscando INSERT statements y VALUES en el archivo original...[/cyan]"
         )
@@ -971,13 +1255,60 @@ def main():
         # Crear lista de índices de columnas que se mantuvieron (0-based)
         kept_indices = [i for i in range(len(columns)) if i not in indices_to_remove]
 
-        insert_sql = extract_insert_statements(
-            sql_text, new_table_name, column_names, 0, kept_indices, column_types
+        # Verificar si hay datos para procesar
+        test_insert_sql = extract_insert_statements(
+            sql_text,
+            new_table_name,
+            column_names,
+            10,
+            kept_indices,
+            column_types,  # Solo 10 para verificar
         )
 
-        if insert_sql.strip():  # Solo escribir si encontramos INSERT statements
-            f.write("\n-- INSERT statements (existentes y extraídos desde VALUES)\n")
-            f.write(insert_sql)
+        if test_insert_sql.strip():
+            # Hay datos - preguntar método de salida
+            use_copy = ask_output_method()
+
+            if use_copy:
+                # Generar COPY statement
+                data_sql = extract_copy_statement(
+                    sql_text,
+                    new_table_name,
+                    column_names,
+                    0,
+                    kept_indices,
+                    column_types,
+                )
+
+                if data_sql.strip():
+                    f.write(
+                        "\n-- COPY statement (generado desde VALUES e INSERT existentes)\n"
+                    )
+                    f.write(data_sql)
+                else:
+                    console.print(
+                        "[yellow]⚠️ No se pudo generar COPY statement[/yellow]"
+                    )
+            else:
+                # Generar INSERT statements
+                data_sql = extract_insert_statements(
+                    sql_text,
+                    new_table_name,
+                    column_names,
+                    0,
+                    kept_indices,
+                    column_types,
+                )
+
+                if data_sql.strip():
+                    f.write(
+                        "\n-- INSERT statements (existentes y extraídos desde VALUES)\n"
+                    )
+                    f.write(data_sql)
+                else:
+                    console.print(
+                        "[yellow]⚠️ No se pudo generar INSERT statements[/yellow]"
+                    )
         else:
             console.print(
                 "[yellow]⚠️ No se encontraron INSERT statements ni VALUES en el archivo[/yellow]"
@@ -996,7 +1327,7 @@ def main():
     console.print(f"📊 Tamaño del archivo generado: {file_size:.2f} MB")
 
     # Preguntar si quiere generar inserts adicionales desde CSV
-    if not insert_sql.strip() and Confirm.ask(
+    if not test_insert_sql.strip() and Confirm.ask(
         "¿No se encontraron VALUES. Deseas generar INSERTs desde un CSV?", default=False
     ):
         csv_path = Prompt.ask("Ruta al CSV (absoluta o relativa)")

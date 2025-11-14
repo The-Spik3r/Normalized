@@ -25,6 +25,7 @@ from rich.progress import (
 from rich.prompt import Prompt, Confirm
 from typing import Dict, List
 from datetime import datetime
+import unicodedata
 
 from csv_to_sql import CSVToSQLConverter
 
@@ -1018,8 +1019,16 @@ class InteractiveCSVConverter:
         # Obtener el total de filas para mostrar en la opción "Archivo completo"
         total_rows = self.count_total_rows()
 
-        # Preguntar cantidad de filas
+        # Preguntar método y cantidad de filas
         questions = [
+            inquirer.List(
+                "method_option",
+                message="¿Qué método quieres usar?",
+                choices=[
+                    "🚀 COPY statement (súper rápido - recomendado)",
+                    "📝 INSERT statements (tradicional)",
+                ],
+            ),
             inquirer.List(
                 "rows_option",
                 message="¿Cuántas filas quieres convertir?",
@@ -1030,11 +1039,15 @@ class InteractiveCSVConverter:
                     f"🌍 Archivo completo ({total_rows:,} filas)",
                     "🛠️  Cantidad personalizada",
                 ],
-            )
+            ),
         ]
 
         answers = inquirer.prompt(questions)
 
+        # Determinar método
+        use_copy = "COPY" in answers["method_option"]
+
+        # Determinar cantidad de filas
         if "pequeña" in answers["rows_option"]:
             max_rows = 100
         elif "mediana" in answers["rows_option"]:
@@ -1079,7 +1092,9 @@ class InteractiveCSVConverter:
 
             try:
                 start_time = datetime.now()
-                sql_file = converter.convert_to_sql(chunk_size=1000, max_rows=max_rows)
+                sql_file = converter.convert_to_sql(
+                    chunk_size=1000, max_rows=max_rows, use_copy=use_copy
+                )
                 end_time = datetime.now()
 
                 progress.update(task1, completed=100)
@@ -1094,12 +1109,14 @@ class InteractiveCSVConverter:
         duration = (end_time - start_time).total_seconds()
         sql_size = os.path.getsize(sql_file) / 1024 / 1024  # MB
         processed_rows = max_rows or "Todas"
+        method_used = "COPY statement" if use_copy else "INSERT statements"
 
         results_panel = f"""
 ✅ [bold green]CONVERSIÓN EXITOSA[/bold green]
 
 📄 [bold]Archivo SQL:[/bold] {sql_file}
 🗂️  [bold]Tabla SQL:[/bold] {self.table_name}
+🚀 [bold]Método:[/bold] {method_used}
 📊 [bold]Filas procesadas:[/bold] {processed_rows}
 📏 [bold]Tamaño SQL:[/bold] {sql_size:.2f} MB
 ⏱️  [bold]Tiempo:[/bold] {duration:.2f} segundos
@@ -1224,6 +1241,164 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
         column_lower = column_name.lower().strip()
         return any(indicator in column_lower for indicator in name_indicators)
 
+    def _robust_sanitize_value(self, value: str) -> str:
+        """
+        Sanitización robusta para valores problemáticos
+
+        Args:
+            value (str): Valor a sanitizar
+
+        Returns:
+            str: Valor sanitizado
+        """
+        if not isinstance(value, str):
+            return str(value)
+
+        # Normalizar Unicode para detectar caracteres problemáticos
+        normalized = unicodedata.normalize("NFKC", str(value))
+
+        # Limpiar y escapar en orden específico
+        sanitized = (
+            normalized.strip()
+            .replace("\\", "\\\\")  # Escapar backslashes PRIMERO
+            .replace("'", "''")  # Escapar comillas simples
+            .replace('"', '""')  # Escapar comillas dobles por si acaso
+            .replace("\t", "\\t")  # Escapar tabs
+            .replace("\n", "\\n")  # Escapar saltos de línea
+            .replace("\r", "\\r")  # Escapar retornos de carro
+            .replace("\x00", "")  # Eliminar NULL bytes
+            .replace("\x1a", "")  # Eliminar SUB (Substitute) caracteres
+            .replace("\x08", "")  # Eliminar backspace
+            .replace("\x0b", "")  # Eliminar vertical tab
+            .replace("\x0c", "")  # Eliminar form feed
+        )
+
+        # Eliminar otros caracteres de control problemáticos
+        sanitized = "".join(
+            char
+            for char in sanitized
+            if unicodedata.category(char) != "Cc" or char in "\t\n\r"
+        )
+
+        return sanitized
+
+    def _create_mapped_csv(self, max_rows: int = None) -> str:
+        """Crea un CSV temporal con columnas mapeadas y renombradas"""
+        temp_csv = f"temp_mapped_{os.path.basename(self.csv_file_path)}"
+
+        try:
+            # Leer el CSV original
+            if max_rows:
+                df = pd.read_csv(
+                    self.csv_file_path, nrows=max_rows, on_bad_lines="skip"
+                )
+            else:
+                df = pd.read_csv(self.csv_file_path, on_bad_lines="skip")
+
+            # Excluir columnas no deseadas
+            if self.excluded_columns:
+                columns_to_keep = [
+                    col for col in df.columns if col not in self.excluded_columns
+                ]
+                df = df[columns_to_keep]
+
+            # Renombrar columnas según el mapeo
+            df = df.rename(columns=self.column_mapping)
+
+            # Guardar CSV temporal
+            df.to_csv(temp_csv, index=False, encoding="utf-8")
+            return temp_csv
+
+        except Exception as e:
+            logging.error(f"Error creando CSV mapeado: {e}")
+            # Devolver archivo original como fallback
+            return self.csv_file_path
+
+    def _generate_copy_statement_with_data(self, sql_file, max_rows: int = None) -> int:
+        """
+        Genera COPY statement con datos incrustados usando STDIN (para CLI interactivo)
+        """
+        # Determinar qué columnas leer (excluir las columnas seleccionadas por el usuario)
+        if self.excluded_columns:
+            # Leer todas las columnas primero para saber cuáles excluir
+            all_columns = pd.read_csv(self.csv_file_path, nrows=0).columns.tolist()
+            columns_to_read = [
+                col for col in all_columns if col not in self.excluded_columns
+            ]
+        else:
+            columns_to_read = None  # Leer todas las columnas
+
+        # Leer datos del CSV
+        if max_rows:
+            df = pd.read_csv(
+                self.csv_file_path,
+                nrows=max_rows,
+                on_bad_lines="skip",
+                usecols=columns_to_read,
+            )
+        else:
+            df = pd.read_csv(
+                self.csv_file_path, on_bad_lines="skip", usecols=columns_to_read
+            )
+
+        # Aplicar mapeo de columnas
+        original_cols_remaining = [
+            col
+            for col in self.column_mapping.keys()
+            if col not in self.excluded_columns
+        ]
+        new_column_names = []
+        for i, actual_col in enumerate(df.columns):
+            if i < len(original_cols_remaining):
+                original_col = original_cols_remaining[i]
+                new_name = self.column_mapping.get(original_col, f"col_{i}")
+                new_column_names.append(new_name)
+            else:
+                new_column_names.append(f"col_{i}")
+
+        df.columns = new_column_names
+
+        # Generar header del COPY statement con formato multilinea
+        columns_formatted = ",\n    ".join(df.columns)
+        copy_header = f"""-- COPY command with inline data
+COPY {self.table_name} (
+    {columns_formatted}
+) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', NULL '\\\\N');
+"""
+        sql_file.write(copy_header)
+
+        # Procesar datos fila por fila
+        processed_rows = 0
+        for _, row in df.iterrows():
+            if max_rows and processed_rows >= max_rows:
+                break
+
+            # Convertir valores a formato COPY (usar \N para NULL, tab como separador)
+            values = []
+            for col in df.columns:
+                value = row[col]
+                if pd.isna(value) or value is None or value == "":
+                    values.append("\\N")  # Sin comillas para NULL
+                elif isinstance(value, str):
+                    # Usar sanitización robusta
+                    sanitized = self._robust_sanitize_value(value)
+
+                    # Envolver en comillas simples para proteger de operadores y caracteres especiales
+                    values.append(f"'{sanitized}'")
+                else:
+                    # Para números y otros tipos, convertir a string y envolver en comillas simples
+                    values.append(f"'{str(value)}'")
+
+            # Escribir línea con tabs como separadores
+            line = "\t".join(values) + "\n"
+            sql_file.write(line)
+            processed_rows += 1
+
+        # Terminar COPY statement
+        sql_file.write(".\n\n")
+
+        return processed_rows
+
     def _escape_sql_value(self, value, column_name: str = "") -> str:
         """
         Escapa valores para SQL con sanitización especial para nombres
@@ -1266,13 +1441,89 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
             escaped = str_value.replace("'", "''")
             return f"'{escaped}'"
 
-    def convert_to_sql(self, chunk_size: int = 1000, max_rows: int = None) -> str:
+    def convert_to_sql(
+        self, chunk_size: int = 1000, max_rows: int = None, use_copy: bool = False
+    ) -> str:
         """Conversión personalizada con mapeo de columnas y manejo robusto de errores"""
+
+        # Si se usa COPY, usar método especializado
+        if use_copy:
+            logging.info(f"Usando método COPY para conversión de {self.csv_file_path}")
+
+            # Configurar archivo de salida
+            base_name = os.path.splitext(os.path.basename(self.csv_file_path))[0]
+            self.sql_file_path = f"{base_name}_copy_statement.sql"
+
+            try:
+                # Leer muestra para detectar tipos de datos
+                sample_df = pd.read_csv(
+                    self.csv_file_path, nrows=1000, on_bad_lines="skip"
+                )
+                if self.excluded_columns:
+                    columns_to_keep = [
+                        col
+                        for col in sample_df.columns
+                        if col not in self.excluded_columns
+                    ]
+                    sample_df = sample_df[columns_to_keep]
+
+                # Aplicar mapeo de columnas
+                remaining_columns = list(sample_df.columns)
+                sample_df.columns = [
+                    self.column_mapping.get(col, col) for col in remaining_columns
+                ]
+                column_types = self._detect_data_types(sample_df)
+
+                # Crear archivo SQL
+                with open(self.sql_file_path, "w", encoding="utf-8") as sql_file:
+                    # Header mejorado
+                    sql_file.write(f"-- {os.path.basename(self.sql_file_path)}\n\n")
+                    sql_file.write(
+                        f"-- Archivo SQL generado desde: {self.csv_file_path}\n"
+                    )
+                    sql_file.write(
+                        f"-- Generado el: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    )
+                    sql_file.write(
+                        "-- Conversión personalizada con COPY FROM STDIN\n\n"
+                    )
+
+                    # Start transaction for safety
+                    sql_file.write("-- Start transaction for safety\n")
+                    sql_file.write("BEGIN;\n\n")
+
+                    # CREATE TABLE personalizado (comentario)
+                    create_table_sql = self.create_table_sql(column_types)
+                    sql_file.write(create_table_sql)
+
+                    # Generar COPY statement con datos
+                    processed_rows = self._generate_copy_statement_with_data(
+                        sql_file, max_rows
+                    )
+
+                    # Footer
+                    sql_file.write(
+                        f"-- Total de registros procesados: {processed_rows}\n"
+                    )
+                    sql_file.write("COMMIT;\n")
+
+                logging.info(
+                    f"Conversión COPY completada. Archivo SQL creado: {self.sql_file_path}"
+                )
+                logging.info(f"Filas procesadas: {processed_rows}")
+
+                return self.sql_file_path
+
+            except Exception as e:
+                logging.error(f"Error durante la conversión COPY: {str(e)}")
+                raise
+
         logging.info(f"Iniciando conversión personalizada de {self.csv_file_path}")
 
         # Configurar archivo de salida
         base_name = os.path.splitext(os.path.basename(self.csv_file_path))[0]
-        self.sql_file_path = f"{base_name}_custom_insert_statements.sql"
+        method_suffix = "copy_statement" if use_copy else "custom_insert_statements"
+        self.sql_file_path = f"{base_name}_{method_suffix}.sql"
 
         # Reiniciar contadores
         self.error_count = 0
@@ -1304,12 +1555,17 @@ class CustomCSVToSQLConverter(CSVToSQLConverter):
             # Crear archivo SQL
             with open(self.sql_file_path, "w", encoding="utf-8") as sql_file:
                 # Header mejorado
+                sql_file.write(f"-- {os.path.basename(self.sql_file_path)}\n\n")
                 sql_file.write(f"-- Archivo SQL generado desde: {self.csv_file_path}\n")
                 sql_file.write(
                     f"-- Generado el: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 )
                 sql_file.write("-- Conversión personalizada con mapeo de columnas\n")
                 sql_file.write("-- Modo robusto: Ignora líneas malformadas\n\n")
+
+                # Start transaction for safety
+                sql_file.write("-- Start transaction for safety\n")
+                sql_file.write("BEGIN;\n\n")
 
                 # CREATE TABLE personalizado
                 create_table_sql = self.create_table_sql(column_types)
